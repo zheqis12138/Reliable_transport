@@ -285,6 +285,7 @@ rel_output (rel_t *r)
 }
 
 /* Called in pre-definded interval*/
+
 void
 rel_timer ()
 {
@@ -292,7 +293,18 @@ rel_timer ()
     // all packets whose timer has expired
     rel_t *current = rel_list;
     while (current != NULL) {
-        // ...
+        buffer_node_t *curr_buffer = buffer_get_first(current->send_buffer);
+        while (curr_buffer != NULL){
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
+            long time_diff = now_ms - curr_buffer->last_retransmit;
+            if (time_diff >= current->timeout){
+                conn_sendpkt(current->c, &curr_buffer->packet, curr_buffer->packet.len);
+                curr_buffer->last_retransmit = now_ms;
+            }
+            curr_buffer = curr_buffer->next;
+        }
         current = current->next;
     }
 }
