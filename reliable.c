@@ -15,29 +15,27 @@
 #include "rlib.h"
 #include "buffer.h"
 
-// The state of a connection a
+
 struct reliable_state {
     rel_t *next;			/* Linked list for traversing all connections */
     rel_t **prev;
 
     conn_t *c;			/* This is the connection object */
 
-    /* Add your own data fields below this */
-    // sender states
-    int snd_una; // unacknowledged packet, next seqno the receiver is expected to get
-    // snd_una = max(snd_una, ackno)
-    int snd_nxt; // seqno of the next packet to send out
-    // snd_wnd - sed_una
-    buffer_t* send_buffer;
-    // receiver states
-    int rcv_nxt;// the next seqno the receiver is expected to receive.
-    buffer_t* rec_buffer;
-    int timer;
     int maxwnd;
     int timeout;
-    int snd_eof;
-    int rcv_eof;
 
+    // sender
+    int snd_una;
+    int snd_nxt;
+    int snd_wnd;
+    buffer_t* send_buffer;
+    int snd_eof;
+
+    // receiver
+    int rcv_nxt;
+    buffer_t* rec_buffer;
+    int rcv_eof;
 };
 rel_t *rel_list;
 
@@ -46,7 +44,7 @@ rel_t *rel_list;
 // set up the state for a connection and return a point to it.
 rel_t *
 rel_create (conn_t *c, const struct sockaddr_storage *ss,
-const struct config_common *cc)
+            const struct config_common *cc)
 {
     rel_t *r;
 
@@ -65,23 +63,24 @@ const struct config_common *cc)
     r->next = rel_list;
     r->prev = &rel_list;
     if (rel_list)
-    rel_list->prev = &r->next;
+        rel_list->prev = &r->next;
     rel_list = r;
 
-    /* Do any other initialization you need here... */
-    // sender side
-    r->snd_una = 1;
-    r->snd_nxt = 1;
-    r->send_buffer = xmalloc(sizeof(buffer_t));
-    r->send_buffer->head = NULL;
-    // receiver side
-    r->rcv_nxt = 1;
-    r->rec_buffer = xmalloc(sizeof(buffer_t));
-    r->rec_buffer->head = NULL;
-    r->maxwnd = cc->window;
-    r->timer = cc->timer;
+    r->maxwnd = cc->window + 1;
     r->timeout = cc->timeout;
 
+    // sender
+    r->snd_una = 1;
+    r->snd_nxt = 1;
+    r->snd_wnd = 1;
+    r->snd_eof = 0;
+    r->send_buffer = xmalloc(sizeof(buffer_t));
+    r->send_buffer->head = NULL;
+    // receiver
+    r-> rcv_nxt = 1;
+    r->rcv_eof = 0;
+    r->rec_buffer = xmalloc(sizeof(buffer_t));
+    r->rec_buffer->head = NULL;
     return r;
 }
 
@@ -93,172 +92,138 @@ rel_destroy (rel_t *r)
     }
     *r->prev = r->next;
     conn_destroy (r->c);
-
-    /* Free any other allocated memory here */
     buffer_clear(r->send_buffer);
     free(r->send_buffer);
     buffer_clear(r->rec_buffer);
     free(r->rec_buffer);
     free(r);
-    // ...
-
 }
 
 // n is the expected length of pkt
-/* The packet is received already. Implement function for reveiving packets
+/* The packet is received already. Implement function for receiving packets
 like error checking, updating states, sending ack... */
 void
 rel_recvpkt (rel_t *r, packet_t *pkt, size_t n)
 {
-    /* Your logic implementation here */
-    int real_sum;
-    int calculated_sum;
-
-    // checksum
-    real_sum = pkt->cksum;
-    // calculate checksum value of a packet
+    uint32_t ackno = (uint32_t) ntohl(pkt->ackno);
+    uint32_t seqno = (uint32_t) ntohl(pkt->seqno);
+    uint16_t pkt_cksum = pkt->cksum;
     pkt->cksum = 0;
-
-    print_pkt(pkt, "a", n);
-
-    calculated_sum = cksum(pkt, n);
-    if (calculated_sum != real_sum){
+    // drop packet if its corrupted
+    if(pkt_cksum != cksum((void*) pkt, n)){
         return;
     }
 
-    // client side (expected to receive ack packet)
-    // if its ACK packet
-    if (n == 8){
-        if (pkt->ackno> r->snd_una){
-            // update status (silde window)
-            r->snd_una = pkt->ackno;
-            buffer_remove(r->send_buffer, pkt->ackno);
-            // send out further value is available
-            if (r->snd_nxt-r->snd_una < r->maxwnd){
-                rel_read(r);
-            }
+    // if the packet is ACK
+    if(n==8){
+        if(ackno>r->snd_una){
+            r->snd_una = ackno;
+            buffer_remove(r->send_buffer, ackno);
         }
+        r->snd_wnd = r->snd_nxt - r->snd_una;
+
+        // of both sender and receiver reach end of file states, transfer finished and destroy the link.
+        if((r->rcv_eof == 1) && (r->snd_eof == 1) && (r->snd_wnd) == 0){
+            rel_destroy(r);
+        }
+        else if(r->snd_wnd < r->maxwnd){
+            rel_read(r);
+        }
+        return;
     }
 
-    // server side
+        // if its data packet ot eof packet
     else {
-        // if its end of file packet, and have written all output data, send EOF to output
-        if (n == 12 && buffer_size(r->rec_buffer) == 0){
-            conn_output(r->c, NULL, 0);
-            r->rcv_eof = 1;
+
+        // if packet already finish data receiving, ignore coming data packets;
+        if(r->rcv_eof == 1){
             return;
         }
 
-        else if (n>12 && n<=512){
-            // if packet already received, send ack but do not buffer;
-            if (pkt->seqno < r->rcv_nxt){
-                struct ack_packet *ackPacket;
-                ackPacket = xmalloc(sizeof(struct ack_packet));
-                ackPacket->len = 8;
-                ackPacket->ackno = r->rcv_nxt;
-                ackPacket->cksum = 0;
-                ackPacket->cksum = cksum(ackPacket, 8);
-                conn_sendpkt(r->c, (packet_t *)ackPacket, 8);
-                return;
+        // packet already in buffer, send ack but don't buffer
+        if(seqno < r->rcv_nxt){
+            // send back ack
+            struct ack_packet *ackpkt;
+            ackpkt = xmalloc(sizeof(struct ack_packet));
+            ackpkt->len = htons(8);
+            ackpkt->ackno = htonl(r->rcv_nxt);
+            ackpkt->cksum = 0;
+            ackpkt->cksum = cksum(ackpkt, 8);
+            conn_sendpkt(r->c, (packet_t *) ackpkt, 8);
+            return;
+        }
+
+        // only proceed packet if it's inside the receiver window
+        if(seqno < r->rcv_nxt + r->maxwnd){
+            // buffer the packet if it's not in buffer yet
+            if(buffer_contains(r->rec_buffer, seqno)==0){
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                buffer_insert(r->rec_buffer, pkt, (now.tv_sec * 1000 + now.tv_sec / 1000));
             }
 
-            else if (pkt->seqno < r->rcv_nxt+r->maxwnd) {
-                // buffer out-of-sequence packets, if receiver buffer is not full
-                // add to output buffer
-                if (!buffer_contains(r->rec_buffer, pkt->seqno)) {
-                    // get current time
-                    struct timeval now;
-                    gettimeofday(&now, NULL);
-                    long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
-                    // check the availability of receiver buffer
-                    if (buffer_size(r->rec_buffer) < r->maxwnd) {
-                        buffer_insert(r->rec_buffer, pkt, now_ms);
-                    } else {
-                        return;
+            // if the receiving packet is at the right sequence of the packet stream
+            if (seqno == r->rcv_nxt){
+                buffer_node_t *current = buffer_get_first(r->rec_buffer);
+                r->rcv_nxt++;
+                while (current->next != NULL) {
+                    if(!buffer_contains(r->rec_buffer, ntohl(current->packet.seqno)+1)){
+                        break;
                     }
-                }
-
-                // update states
-                if (pkt->seqno == r->rcv_nxt) {
-                    // find the highest consecutive seqno in the buffer
                     r->rcv_nxt++;
-                    buffer_node_t *curr = buffer_get_first(r->rec_buffer);
-                    while (curr->next != NULL){
-                        if (!buffer_contains(r->rec_buffer, curr->packet.seqno+1)){
-                            break;
-                        }
-                        r->rcv_nxt++;
-                        curr = curr->next;
-                    }
-
-                    // write it to output with rel_output
-                    rel_output(r);
+                    current = current->next;
                 }
-
-                // send acknoledge
-                struct ack_packet *ackPacket;
-                ackPacket = xmalloc(sizeof(struct ack_packet));
-                ackPacket->len = 8;
-                ackPacket->ackno = r->rcv_nxt;
-                ackPacket->cksum = 0;
-                ackPacket->cksum = cksum(ackPacket, 8);
-                conn_sendpkt(r->c, (packet_t*)ackPacket, 8);
-                return;
+                rel_output(r);
             }
-        }
+            // send back ack packet
+            struct ack_packet *ackpkt;
+            ackpkt = xmalloc(sizeof(struct ack_packet));
+            ackpkt->len = htons(8);
+            ackpkt->ackno = htonl(r->rcv_nxt);
+            ackpkt->cksum = 0;
+            ackpkt->cksum = cksum(ackpkt, 8);
+            conn_sendpkt(r->c, (packet_t *) ackpkt, 8);
 
-        // if packet size > 500, drop packet
-        else{
-            return;
         }
     }
-
-    // If everything is finished, destroy the connection
-    if (r->snd_eof == 1 && r->rcv_eof == 1 && r->snd_una == r->snd_nxt){
-        rel_destroy(r);
-    }
-    
 }
 
-/* Is called whenever type something in the console.
-In this case, read data from the console, put it in the packet, then to the
-sending buffer(if buffer has enough space), then to the network(is slide window has enough space).
-*/
 void
 rel_read (rel_t *s)
 {
-    /* Your logic implementation here */
     // if send window is less than the max window, read input from stdin, make packet, buffer and send the packet.
     // finally change the states of the connection.
-    while (s->snd_nxt - s->snd_una < s->maxwnd ){
+
+    while(s->snd_wnd < s->maxwnd){
         // construct packet
         packet_t *pkt;
         pkt = xmalloc(sizeof(packet_t));
-        int num_bytes = conn_input(s->c, pkt->data, 500);
+        int nrBytes = conn_input(s->c, pkt->data, 500);
         // if no available input, do nothing
-        if (num_bytes == 0){
+        if(nrBytes == 0){
             free(pkt);
             return;
         }
-        // else if end of file
-        else if (num_bytes == -1){
-            num_bytes = 0;
+        // else if end of file, send eof packet
+        if(nrBytes == -1){
+            nrBytes = 0;
             s->snd_eof = 1;
         }
-        pkt->len = 12 + num_bytes;
-        pkt->ackno = s->snd_una;
-        pkt->seqno = s->snd_nxt;
+        pkt->len = htons(nrBytes + 12);
+        pkt->seqno = htonl(s->snd_nxt);
+        pkt->ackno = s->rcv_nxt;
         pkt->cksum = 0;
-        pkt->cksum = cksum(pkt, 12+num_bytes);
-        // buffer the packet
+        pkt->cksum = cksum(pkt, nrBytes+12);
+
+        // buffer and send packet
         struct timeval now;
         gettimeofday(&now, NULL);
-        long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
-        buffer_insert(s->send_buffer, pkt, now_ms);
-        // send the packet
-        conn_sendpkt(s->c, pkt, 12+num_bytes);
-        // change statuss
+        long curr_time = now.tv_sec * 1000 + now.tv_sec / 1000;
+        buffer_insert(s->send_buffer, pkt, curr_time);
+        conn_sendpkt(s->c, pkt, nrBytes+12);
+        // change status
         s->snd_nxt++;
+        s->snd_wnd = s->snd_nxt - s->snd_una;
         free(pkt);
     }
 }
@@ -268,43 +233,46 @@ to the console */
 void
 rel_output (rel_t *r)
 {
-    /* Your logic implementation here */
-    // if packet->data <= output buffer, output(call conn_output). else, do not output.
-    // output the first packet in the receiver buffer
-    buffer_node_t *curr_node = buffer_get_first(r->rec_buffer);
-    buffer_node_t *next_node = curr_node->next;
-    conn_output(r->c, curr_node->packet.data, curr_node->packet.len-12);
-    buffer_remove_first(r->rec_buffer);
-    // output the consequent packet if it is the right one
-    while(next_node && next_node->packet.seqno - curr_node->packet.seqno == 1){
-        curr_node = next_node;
-        next_node = curr_node->next;
-        conn_output(r->c, curr_node->packet.data, curr_node->packet.len-12);
-        buffer_remove_first(r->rec_buffer);
+    buffer_node_t *current = buffer_get_first(r->rec_buffer);
+    while (current != NULL) {
+
+        /* if the eof packet is on the right place, it means the job of the receiver has finished, so output eof
+         * to stdout and set rev_eof to 1 */
+        if((ntohl(current->packet.seqno) < r->rcv_nxt) && ntohs(current->packet.len) == 12){
+            conn_output(r->c, NULL, 0);
+            r->rcv_eof = 1;
+            return;
+        }
+
+        // if the packet is on the right place, output it to stdout and remove it from the output buffer.
+        if (ntohl(current->packet.seqno) < r->rcv_nxt) {
+            conn_output(r->c, current->packet.data, ntohs(current->packet.len)-12);
+            buffer_remove_first(r->rec_buffer);
+        }
+        current = current->next;
     }
 }
-
-/* Called in pre-definded interval*/
 
 void
 rel_timer ()
 {
     // Go over all reliable senders, and have them send out
     // all packets whose timer has expired
+
     rel_t *current = rel_list;
     while (current != NULL) {
-        buffer_node_t *curr_buffer = buffer_get_first(current->send_buffer);
-        while (curr_buffer != NULL){
+        buffer_node_t *currentpkt = buffer_get_first(rel_list->send_buffer);
+        while(currentpkt != NULL){
             struct timeval now;
             gettimeofday(&now, NULL);
-            long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
-            long time_diff = now_ms - curr_buffer->last_retransmit;
-            if (time_diff >= current->timeout){
-                conn_sendpkt(current->c, &curr_buffer->packet, curr_buffer->packet.len);
-                curr_buffer->last_retransmit = now_ms;
+            long curr_time = now.tv_sec * 1000 + now.tv_sec / 1000;
+            long timediff = curr_time - currentpkt->last_retransmit;
+            if(timediff >= rel_list->timeout){
+                conn_sendpkt(rel_list->c, &currentpkt->packet, ntohs(currentpkt->packet.len));
+                currentpkt->last_retransmit = curr_time;
             }
-            curr_buffer = curr_buffer->next;
+            currentpkt = currentpkt->next;
         }
-        current = current->next;
+        current = rel_list->next;
     }
 }
